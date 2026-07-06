@@ -1,0 +1,3 @@
+name,pk_len,sig_len,sk_len,keygen_ns,sign_ns,verify_ns,verify_cyc,verify_iters,vs_pqclean
+Falcon-512,897,666,,,,14083,,1000,0.67
+Falcon-512 (PQClean C),897,666,1281,4657875,151042,21167,,1000,1.00

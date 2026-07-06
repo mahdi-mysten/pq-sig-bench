@@ -1,0 +1,17 @@
+[package]
+name = "pq-sig-bench"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2021"
+publish = false
+description = "Signature benchmarks for the post-quantum schemes in the fastcrypto pq-schemes branch"
+
+[workspace]
+
+[dependencies]
+fastcrypto = { git = "https://github.com/mahdi-mysten/fastcrypto", branch = "pq-schemes" }
+# Keygen/sign source for the Falcon rows, and the producer of the one padded
+# signature both Falcon rows are timed against.
+pqcrypto-falcon = "0.4"
+pqcrypto-traits = "0.3"
+
