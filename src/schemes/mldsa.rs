@@ -4,9 +4,7 @@
 //! ML-DSA-44 (FIPS 204): one signature format, five implementations. FIPS 204
 //! fixes the byte encodings (pk 1312, sig 2420), so every row verifies the
 //! identical (pk, sig) pair, generated once by libcrux with a fixed seed and
-//! deterministic signing. libcrux is the core the fastcrypto `mldsa44` module
-//! wraps, so its row doubles as the fastcrypto number until that module lands
-//! on the branch.
+//! deterministic signing.
 //!
 //! Sign rows are deterministic where the API offers it (libcrux, RustCrypto,
 //! fips204 via a fixed hedging seed); PQClean and aws-lc-rs sign hedged. The
