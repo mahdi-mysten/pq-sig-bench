@@ -10,7 +10,7 @@
 //! the identical signature bytes; without that, a backend could look faster
 //! merely because it was handed different input.
 
-use crate::{timing, Budget, Meta, Row, Scheme, MSG};
+use crate::{sign_msg, timing, Budget, Meta, Row, Scheme, MSG};
 use fastcrypto::falcon512::{
     Falcon512PublicKey, Falcon512Signature, FALCON512_PUBLIC_KEY_LENGTH, FALCON512_SIGNATURE_LENGTH,
 };
@@ -35,7 +35,10 @@ fn shared_triple() -> &'static (Vec<u8>, Vec<u8>) {
 }
 
 fn falcon_meta(name: &'static str) -> Meta {
-    Meta { name }
+    Meta {
+        scheme: "FN-DSA-512",
+        name,
+    }
 }
 
 fn parsed_triple() -> (Falcon512PublicKey, Falcon512Signature) {
@@ -58,8 +61,10 @@ impl Scheme for Falcon512 {
     fn measure(&self, b: &Budget) -> Row {
         let (pk, sig) = parsed_triple();
         let verify = timing::measure(|| pk.verify(MSG, &sig).is_ok(), b.warmup, b.verify_iters);
-        // Verify-only by design (signing carries Falcon's FP sampler and
-        // never runs on validators), so no keygen/sign cells.
+
+        // No keygen/sign cells: fastcrypto has no Falcon signing algorithm of
+        // its own (its KeyPair delegates to PQClean), so those costs belong
+        // to the PQClean row below.
         Row {
             meta: self.meta(),
             pk_len: FALCON512_PUBLIC_KEY_LENGTH,
@@ -91,11 +96,17 @@ impl Scheme for Falcon512PqClean {
         let pk = f512::PublicKey::from_bytes(pk_bytes).expect("shared pk parses");
         let sig = f512::DetachedSignature::from_bytes(sig_bytes).expect("shared sig parses");
 
-        // Keygen/sign cost doesn't depend on the key, so a fresh keypair is
-        // fine here; verify must use the shared triple.
         let (_, sk) = f512::keypair();
         let keygen = timing::measure(f512::keypair, b.warmup, b.offchain_iters);
-        let sign = timing::measure(|| f512::detached_sign(MSG, &sk), b.warmup, b.offchain_iters);
+        let mut i = 0u64;
+        let sign = timing::measure(
+            || {
+                i += 1;
+                f512::detached_sign(&sign_msg(i), &sk)
+            },
+            b.warmup,
+            b.offchain_iters,
+        );
         let verify = timing::measure(
             || f512::verify_detached_signature(&sig, MSG, &pk).is_ok(),
             b.warmup,
@@ -124,9 +135,7 @@ impl Scheme for Falcon512PqClean {
         let roundtrip = f512::verify_detached_signature(&sig, MSG, &pk).is_ok();
         let tampered = f512::verify_detached_signature(&sig, b"tampered", &pk).is_err();
 
-        // Interop gate: the shared PQClean signature must also verify under
-        // fastcrypto's verifier, otherwise the two rows are not measuring the
-        // same signature format and the comparison is meaningless.
+        // Interop gate: the shared PQClean signature must also verify under fastcrypto's verifier
         let (fc_pk, fc_sig) = parsed_triple();
         let interop = fc_pk.verify(MSG, &fc_sig).is_ok();
 

@@ -2,13 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Runs every row (self-check, then measure) and writes `REPORT.md` and `results.csv`
-
 use pq_sig_bench::{all_schemes, Budget, Row};
 use std::fmt::Write as _;
 use std::fs;
 
-/// The reference row every verify time is compared against.
-const ANCHOR: &str = "Falcon-512 (PQClean C)";
+/// The per-scheme reference row every verify time is compared against.
+const ANCHOR: &str = "PQClean C";
 
 fn fmt_ns(ns: u64) -> String {
     if ns >= 1_000_000_000 {
@@ -25,7 +24,7 @@ fn fmt_ns(ns: u64) -> String {
 fn opt_ns(t: Option<pq_sig_bench::Timing>) -> String {
     match t {
         Some(t) => fmt_ns(t.ns_median),
-        None => "—".to_string(),
+        None => "n/a".to_string(),
     }
 }
 
@@ -45,13 +44,26 @@ fn main() {
         rows.push(s.measure(&budget));
     }
 
-    let anchor_verify_ns = rows
+    // The gas-proxy anchor: what a validator runs today.
+    let ed25519_verify_ns = rows
         .iter()
-        .find(|r| r.meta.name == ANCHOR)
+        .find(|r| r.meta.scheme == "Ed25519")
         .map(|r| r.verify.ns_median);
+    let ratio_ed = |r: &Row| -> String {
+        match ed25519_verify_ns {
+            Some(a) if a > 0 => format!("{:.2}×", r.verify.ns_median as f64 / a as f64),
+            _ => "—".to_string(),
+        }
+    };
 
+    // Each scheme group is anchored on its own PQClean C row.
+    let anchor_for = |scheme: &str| -> Option<u64> {
+        rows.iter()
+            .find(|r| r.meta.scheme == scheme && r.meta.name.contains(ANCHOR))
+            .map(|r| r.verify.ns_median)
+    };
     let ratio = |r: &Row| -> String {
-        match anchor_verify_ns {
+        match anchor_for(r.meta.scheme) {
             Some(a) if a > 0 => format!("{:.2}×", r.verify.ns_median as f64 / a as f64),
             _ => "—".to_string(),
         }
@@ -66,10 +78,11 @@ fn main() {
 
     // ---- REPORT.md ----
     let mut md = String::new();
-    writeln!(md, "# Falcon-512 Verify Benchmark — Measured Report\n").unwrap();
+    writeln!(md, "# PQ Signature Benchmark — Measured Report\n").unwrap();
     writeln!(
         md,
-        "> Median of **{} iterations** for verify (the PQShield-zoo method) and\n\
+        "> Within each scheme every row verifies the identical (pk, sig) bytes.\n\
+         > Median of **{} iterations** for verify (the PQShield-zoo method) and\n\
          > **{}** for keygen/sign (off-chain context), warmup {}.\n\
          > Measurement host: **{}**.\n",
         budget.verify_iters, budget.offchain_iters, budget.warmup, arch
@@ -79,52 +92,36 @@ fn main() {
     writeln!(md, "## 1. Verify cost + footprint\n").unwrap();
     writeln!(
         md,
-        "| Implementation | pk (B) | sig (B) | pk+sig (B) | verify | vs PQClean C |"
+        "| Scheme | Implementation | pk (B) | sig (B) | pk+sig (B) | keygen | sign | verify | vs Ed25519 |"
     )
     .unwrap();
-    writeln!(md, "| --- | --:| --:| --:| --:| --:|").unwrap();
+    writeln!(md, "| --- | --- | --:| --:| --:| --:| --:| --:| --:|").unwrap();
     for r in &rows {
         writeln!(
             md,
-            "| {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            r.meta.scheme,
             r.meta.name,
             r.pk_len,
             r.sig_len,
             r.onchain_bytes(),
-            fmt_ns(r.verify.ns_median),
-            ratio(r),
-        )
-        .unwrap();
-    }
-
-    writeln!(md, "\n## 2. Full timing (keygen / sign / verify median)\n").unwrap();
-    writeln!(
-        md,
-        "| Implementation | keygen | sign | verify | verify iters |"
-    )
-    .unwrap();
-    writeln!(md, "| --- | --:| --:| --:| --:|").unwrap();
-    for r in &rows {
-        writeln!(
-            md,
-            "| {} | {} | {} | {} | {} |",
-            r.meta.name,
             opt_ns(r.keygen),
             opt_ns(r.sign),
             fmt_ns(r.verify.ns_median),
-            r.verify.iters,
+            ratio_ed(r),
         )
         .unwrap();
     }
 
     if has_cycles {
         writeln!(md, "\n## 2b. Verify cycles (x86_64 rdtsc, median)\n").unwrap();
-        writeln!(md, "| Implementation | verify cycles |").unwrap();
-        writeln!(md, "| --- | --:|").unwrap();
+        writeln!(md, "| Scheme | Implementation | verify cycles |").unwrap();
+        writeln!(md, "| --- | --- | --:|").unwrap();
         for r in &rows {
             writeln!(
                 md,
-                "| {} | {} |",
+                "| {} | {} | {} |",
+                r.meta.scheme,
                 r.meta.name,
                 r.verify
                     .cyc_median
@@ -142,13 +139,14 @@ fn main() {
     let mut csv = String::new();
     writeln!(
         csv,
-        "name,pk_len,sig_len,sk_len,keygen_ns,sign_ns,verify_ns,verify_cyc,verify_iters,vs_pqclean"
+        "scheme,impl,pk_len,sig_len,sk_len,keygen_ns,sign_ns,verify_ns,verify_cyc,verify_iters,vs_ed25519,vs_pqclean"
     )
     .unwrap();
     for r in &rows {
         writeln!(
             csv,
-            "{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{}",
+            r.meta.scheme,
             r.meta.name,
             r.pk_len,
             r.sig_len,
@@ -163,6 +161,7 @@ fn main() {
                 .map(|c| c.to_string())
                 .unwrap_or_default(),
             r.verify.iters,
+            ratio_ed(r).trim_end_matches('×'),
             ratio(r).trim_end_matches('×'),
         )
         .unwrap();
@@ -170,5 +169,4 @@ fn main() {
     fs::write(out("results.csv"), &csv).expect("write results.csv");
 
     println!("\n{md}");
-    eprintln!("wrote REPORT.md and results.csv");
 }

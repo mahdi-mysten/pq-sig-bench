@@ -8,12 +8,23 @@ pub use timing::{Budget, Timing};
 mod schemes;
 pub use schemes::all_schemes;
 
-
 pub const MSG: &[u8] = b"sui post-quantum native authenticator benchmark";
+
+/// Message for sign-timing iteration `i`: [`MSG`] plus a counter, so
+/// deterministic signers sample ~`iters` different rejection paths instead of
+/// re-running the one path their (key, message) pair happens to hit.
+pub fn sign_msg(i: u64) -> Vec<u8> {
+    let mut m = MSG.to_vec();
+    m.extend_from_slice(&i.to_le_bytes());
+    m
+}
 
 /// Static description of a measured row.
 #[derive(Clone, Copy)]
 pub struct Meta {
+    /// Scheme family the row belongs to ("Falcon-512", "ML-DSA-44").
+    pub scheme: &'static str,
+    /// Implementation label; "PQClean C" is the per-scheme ratio anchor.
     pub name: &'static str,
 }
 
