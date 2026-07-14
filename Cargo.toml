@@ -4,23 +4,23 @@ version = "0.1.0"
 license = "Apache-2.0"
 edition = "2021"
 publish = false
-description = "Signature benchmarks for the post-quantum schemes in the fastcrypto pq-schemes branch"
+description = "Signature benchmarks for the post-quantum schemes proposed for fastcrypto"
 
 [workspace]
 
 [dependencies]
-fastcrypto = { git = "https://github.com/mahdi-mysten/fastcrypto", branch = "pq-schemes" }
-# Keygen/sign source for the Falcon rows, and the producer of the one padded
-# signature both Falcon rows are timed against.
-pqcrypto-falcon = "0.4"
+# Ed25519 baseline and the FN-DSA-512 row. `falcon-sign` exposes keygen/sign;
+# verify is always available through the in-crate strict verifier.
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", branch = "mahdi/fn-dsa-512", features = ["falcon-sign"] }
+
+# FN-DSA-1024 row, plus the interop oracle the FN-DSA-512 self-check runs
+# against. default-features = false matches fastcrypto's own configuration
+# (portable "clean" C, no NEON/AVX2); cargo unifies features per crate, so a
+# default-features dep here would silently swap the SIMD build into
+# fastcrypto's sign path too.
+pqcrypto-falcon = { version = "0.4", default-features = false, features = ["std"] }
 pqcrypto-traits = "0.3"
 
-# ML-DSA-44 rows: four independent implementations of the same FIPS 204
-# byte format, all verifying one shared (pk, sig) pair.
-libcrux-ml-dsa = { version = "0.0.9", default-features = false, features = ["mldsa44"] }
-ml-dsa = "0.1.1"
-fips204 = { version = "0.4.6", default-features = false, features = ["default-rng", "ml-dsa-44"] }
-pqcrypto-mldsa = "0.1"
-rand = "0.8.5"
+# ML-DSA-44/65/87 rows (mldsa-native C imported by AWS-LC, behind `unstable`).
 aws-lc-rs = { version = "1.17", features = ["unstable"] }
-
+rand = "0.8.5"

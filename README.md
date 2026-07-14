@@ -1,21 +1,22 @@
 # Post-quantum signature benchmarks
 
 Timing benchmarks for the post-quantum signature schemes we are adding to
-[fastcrypto on the `pq-schemes` branch](https://github.com/mahdi-mysten/fastcrypto/tree/pq-schemes).
+[fastcrypto on the `mahdi/fn-dsa-512` branch](https://github.com/MystenLabs/fastcrypto/tree/mahdi/fn-dsa-512).
 
 The report answers two questions. How expensive is each scheme to verify
-compared to the Ed25519 verification Sui runs today? And within one
-scheme, how does our implementation compare to the alternatives? For each
-row it prints the public key and signature sizes, the median keygen, sign,
-and verify times, and the verify cost as a ratio of Ed25519.
+compared to the Ed25519 verification Sui runs today? And what do the
+parameter sets cost relative to each other, measured the same way on the
+same machine? For each row it prints the public key and signature sizes,
+the median keygen, sign, and verify times, and the verify cost as a ratio
+of Ed25519.
 
-The comparison stays fair because a signature scheme's byte format is
-fixed by its standard. For each scheme, one key pair and one signature are
-generated once, and every implementation verifies those exact bytes. Any
-timing difference is the implementation, not the input. Before anything is
-timed, each implementation has to verify the shared signature and reject a
-tampered copy of it. Implementations that can also sign must produce
-signatures the others accept.
+One implementation is benchmarked per row: the one we would actually run.
+Correctness is still gated before anything is timed. Every row has to
+verify a signature it produced and reject a tampered copy, and the
+FN-DSA-512 row additionally cross-verifies with PQClean's C in both
+directions (our signature under their verifier, theirs under ours), so
+the row is proven to measure the same math as the reference
+implementation.
 
 ## What is measured
 
@@ -25,20 +26,27 @@ verifications, which roughly halves the amortized cost, and no PQ scheme
 can be batched. The "vs Ed25519" ratios in the report therefore understate
 the real gap by about 2x.
 
-FN-DSA-512 (Falcon) has two rows: fastcrypto's verifier and PQClean's
-reference C via `pqcrypto-falcon`. The fastcrypto row reports verify only.
-Its keygen and sign are wip, so those cells read n/a and the PQClean row
-carries the signing costs.
+FN-DSA-512 (Falcon) is one row, measured through fastcrypto's public API
+with the `falcon-sign` feature. Verification is the in-crate
+Montgomery-NTT port of the reference verifier in strict canonical mode.
+Key generation and signing delegate to PQClean's portable
+`falcon-padded-512` C, and signing re-verifies every signature through
+the strict verifier before returning it, so the sign time includes that
+gate. It is the cost of the API as shipped, not of the raw C signer.
 
-ML-DSA-44 has five rows, one per implementation:
+FN-DSA-1024 has no fastcrypto implementation yet, so its row measures
+PQClean's portable C (`falcon-padded-1024`, via the
+[`pqcrypto-falcon`](https://github.com/rustpq/pqcrypto) bindings) for all
+three operations. Both Falcon rows use the padded, fixed-size signature
+format, and PQClean is built without SIMD (no NEON/AVX2) to match the
+configuration fastcrypto ships.
 
-| Row | What it is |
-| --- | --- |
-| [libcrux](https://github.com/cryspen/libcrux/tree/main/libcrux-ml-dsa) | Cryspen's crate, portable code path. |
-| [RustCrypto ml-dsa](https://github.com/RustCrypto/signatures/tree/master/ml-dsa) | Pure Rust, from the RustCrypto signatures repo. |
-| [fips204](https://github.com/integritychain/fips204) | Pure Rust, by integritychain. |
-| [PQClean C](https://github.com/PQClean/PQClean) | The C reference code, via the [`pqcrypto-mldsa`](https://github.com/rustpq/pqcrypto) bindings. |
-| [aws-lc-rs](https://github.com/aws/aws-lc-rs) | AWS-LC's C implementation, behind the crate's `unstable` feature. |
+ML-DSA is measured through [aws-lc-rs](https://github.com/aws/aws-lc-rs)
+at all three security levels, 44, 65, and 87, behind the crate's
+`unstable` feature. An earlier revision of this repo benchmarked five
+ML-DSA implementations side by side; the audit and adoption notes on all
+five are kept at the bottom as the background for why aws-lc-rs is the
+one we report.
 
 ## How to run it
 
@@ -51,7 +59,8 @@ build compiles AWS-LC from source and takes a few minutes. After that, a
 full run takes a few seconds. It prints the report and writes `REPORT.md`
 and `results.csv` to the repo root.
 
-The fastcrypto dependency tracks the `pq-schemes` branch of [this fork](https://github.com/mahdi-mysten/fastcrypto). Run
+The fastcrypto dependency tracks the `mahdi/fn-dsa-512` branch of
+[MystenLabs/fastcrypto](https://github.com/MystenLabs/fastcrypto). Run
 `cargo update -p fastcrypto` after a new push there.
 
 ## How the timing works
@@ -68,16 +77,12 @@ Two details matter more than they look:
    Without it, whichever row happens to run first reads about 50% slower
    on M-series machines, because the core has not reached its sustained
    frequency yet.
-2. Sign timing uses a different message on every iteration. Deterministic
-   ML-DSA signing runs a rejection loop whose length depends on the exact
-   key and message. With a fixed message, each row would keep re-timing
-   the one lucky or unlucky path its inputs happen to hit. Varying the
-   message samples the real distribution.
-
-Where an API offers deterministic signing, the benchmark uses it: libcrux,
-RustCrypto, and fips204 with a fixed hedging seed. PQClean and aws-lc-rs
-only sign hedged, which adds one 32-byte RNG draw per signature. At these
-costs that is noise.
+2. Sign timing uses a different message on every iteration. Falcon and
+   ML-DSA signing run rejection loops whose length depends on the exact
+   inputs. The benchmarked signers are all randomized (fastcrypto's Falcon
+   draws its salt from the OS, aws-lc-rs signs hedged), which already
+   varies the path per call; varying the message as well keeps the method
+   valid for any deterministic signer added later.
 
 ## Falcon implementations we know about but do not bench
 
@@ -94,7 +99,19 @@ That is the fastest Falcon verify anywhere and a useful ceiling to keep in
 mind. It cannot run on Apple Silicon and the PR is still open, so it waits
 until a validator-class x86 host is available for this benchmark.
 
-## Audits, and who actually uses these (ML-DSA rows)
+## Audits, and who actually uses these (ML-DSA implementations)
+
+Only aws-lc-rs is benchmarked now. The write-ups for all five
+implementations an earlier revision compared are kept below, because they
+are the background for that choice.
+
+| Implementation | What it is |
+| --- | --- |
+| [libcrux](https://github.com/cryspen/libcrux/tree/main/libcrux-ml-dsa) | Cryspen's crate, portable code path. |
+| [RustCrypto ml-dsa](https://github.com/RustCrypto/signatures/tree/master/ml-dsa) | Pure Rust, from the RustCrypto signatures repo. |
+| [fips204](https://github.com/integritychain/fips204) | Pure Rust, by integritychain. |
+| [PQClean C](https://github.com/PQClean/PQClean) | The C reference code, via the [`pqcrypto-mldsa`](https://github.com/rustpq/pqcrypto) bindings. |
+| [aws-lc-rs](https://github.com/aws/aws-lc-rs) | AWS-LC's C implementation, behind the crate's `unstable` feature. |
 
 I checked each implementation for two things: has anyone independently
 audited it, and does anyone serious depend on it. All claims were checked
@@ -121,7 +138,7 @@ the hax pipeline extracting unannotated loops in a way that leaves them
 outside the proofs. There was also a high-severity bug in the AVX2
 verifier, CVSS 8.2, fixed in 0.0.9
 ([GHSA-fhvh-vw7h-9xf3](https://github.com/advisories/GHSA-fhvh-vw7h-9xf3)).
-The portable path we benchmark was not affected.
+The portable path we benchmarked was not affected.
 
 On adoption: Signal, Mozilla NSS, and OpenMLS all ship libcrux code, but
 the ML-KEM and classical crates. I could not find a notable production

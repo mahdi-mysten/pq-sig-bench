@@ -1,7 +1,7 @@
 // Copyright (c) 2022, Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Measurement harness for the post-quantum signature schemes in the fastcrypto `pq-schemes` branch
+//! Measurement harness for the post-quantum signature schemes proposed for fastcrypto
 pub mod timing;
 pub use timing::{Budget, Timing};
 
@@ -22,9 +22,9 @@ pub fn sign_msg(i: u64) -> Vec<u8> {
 /// Static description of a measured row.
 #[derive(Clone, Copy)]
 pub struct Meta {
-    /// Scheme family the row belongs to ("Falcon-512", "ML-DSA-44").
+    /// Scheme family the row belongs to ("FN-DSA-512", "ML-DSA-65").
     pub scheme: &'static str,
-    /// Implementation label; "PQClean C" is the per-scheme ratio anchor.
+    /// Implementation label ("fastcrypto", "PQClean C", "aws-lc-rs").
     pub name: &'static str,
 }
 

@@ -10,12 +10,10 @@ mod mldsa;
 pub fn all_schemes() -> Vec<Box<dyn Scheme>> {
     vec![
         Box::new(ed25519::Ed25519Baseline),
-        Box::new(falcon::Falcon512),
-        Box::new(falcon::Falcon512PqClean),
-        Box::new(mldsa::MlDsa44Libcrux),
-        Box::new(mldsa::MlDsa44RustCrypto),
-        Box::new(mldsa::MlDsa44Fips204),
-        Box::new(mldsa::MlDsa44PqClean),
-        Box::new(mldsa::MlDsa44AwsLc),
+        Box::new(falcon::Falcon512Fastcrypto),
+        Box::new(falcon::Falcon1024PqClean),
+        Box::new(mldsa::ML_DSA_44_ROW),
+        Box::new(mldsa::ML_DSA_65_ROW),
+        Box::new(mldsa::ML_DSA_87_ROW),
     ]
 }

@@ -6,9 +6,6 @@ use pq_sig_bench::{all_schemes, Budget, Row};
 use std::fmt::Write as _;
 use std::fs;
 
-/// The per-scheme reference row every verify time is compared against.
-const ANCHOR: &str = "PQClean C";
-
 fn fmt_ns(ns: u64) -> String {
     if ns >= 1_000_000_000 {
         format!("{:.2} s", ns as f64 / 1e9)
@@ -39,8 +36,13 @@ fn main() {
     let mut rows: Vec<Row> = Vec::with_capacity(schemes.len());
     for s in &schemes {
         let m = s.meta();
-        assert!(s.self_check(), "self-check FAILED for {}", m.name);
-        eprintln!("  • {:<28} ok", m.name);
+        assert!(
+            s.self_check(),
+            "self-check FAILED for {} / {}",
+            m.scheme,
+            m.name
+        );
+        eprintln!("  • {:<12} {:<24} ok", m.scheme, m.name);
         rows.push(s.measure(&budget));
     }
 
@@ -51,19 +53,6 @@ fn main() {
         .map(|r| r.verify.ns_median);
     let ratio_ed = |r: &Row| -> String {
         match ed25519_verify_ns {
-            Some(a) if a > 0 => format!("{:.2}×", r.verify.ns_median as f64 / a as f64),
-            _ => "—".to_string(),
-        }
-    };
-
-    // Each scheme group is anchored on its own PQClean C row.
-    let anchor_for = |scheme: &str| -> Option<u64> {
-        rows.iter()
-            .find(|r| r.meta.scheme == scheme && r.meta.name.contains(ANCHOR))
-            .map(|r| r.verify.ns_median)
-    };
-    let ratio = |r: &Row| -> String {
-        match anchor_for(r.meta.scheme) {
             Some(a) if a > 0 => format!("{:.2}×", r.verify.ns_median as f64 / a as f64),
             _ => "—".to_string(),
         }
@@ -81,7 +70,8 @@ fn main() {
     writeln!(md, "# PQ Signature Benchmark — Measured Report\n").unwrap();
     writeln!(
         md,
-        "> Within each scheme every row verifies the identical (pk, sig) bytes.\n\
+        "> One implementation per row; each passes a sign→verify + tamper self-check\n\
+         > before timing (FN-DSA-512 also cross-verifies with PQClean C, both ways).\n\
          > Median of **{} iterations** for verify (the PQShield-zoo method) and\n\
          > **{}** for keygen/sign (off-chain context), warmup {}.\n\
          > Measurement host: **{}**.\n",
@@ -139,13 +129,13 @@ fn main() {
     let mut csv = String::new();
     writeln!(
         csv,
-        "scheme,impl,pk_len,sig_len,sk_len,keygen_ns,sign_ns,verify_ns,verify_cyc,verify_iters,vs_ed25519,vs_pqclean"
+        "scheme,impl,pk_len,sig_len,sk_len,keygen_ns,sign_ns,verify_ns,verify_cyc,verify_iters,vs_ed25519"
     )
     .unwrap();
     for r in &rows {
         writeln!(
             csv,
-            "{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{}",
             r.meta.scheme,
             r.meta.name,
             r.pk_len,
@@ -162,7 +152,6 @@ fn main() {
                 .unwrap_or_default(),
             r.verify.iters,
             ratio_ed(r).trim_end_matches('×'),
-            ratio(r).trim_end_matches('×'),
         )
         .unwrap();
     }
