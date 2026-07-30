@@ -5,7 +5,7 @@
 pub mod timing;
 pub use timing::{Budget, Timing};
 
-mod schemes;
+pub mod schemes;
 pub use schemes::all_schemes;
 
 pub const MSG: &[u8] = b"sui post-quantum native authenticator benchmark";
