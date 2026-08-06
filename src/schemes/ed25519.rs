@@ -27,25 +27,16 @@ impl Scheme for Ed25519Baseline {
         let kp = Ed25519KeyPair::generate(&mut rng);
         let sig = kp.sign(MSG);
 
-        let keygen = timing::measure(
-            || Ed25519KeyPair::generate(&mut rng),
-            b.warmup,
-            b.offchain_iters,
-        );
+        let keygen = timing::measure(|| Ed25519KeyPair::generate(&mut rng), b);
         let mut i = 0u64;
         let sign = timing::measure(
             || {
                 i += 1;
                 kp.sign(&sign_msg(i))
             },
-            b.warmup,
-            b.offchain_iters,
+            b,
         );
-        let verify = timing::measure(
-            || kp.public().verify(MSG, &sig).is_ok(),
-            b.warmup,
-            b.verify_iters,
-        );
+        let verify = timing::measure(|| kp.public().verify(MSG, &sig).is_ok(), b);
 
         Row {
             meta: self.meta(),
