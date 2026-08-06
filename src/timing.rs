@@ -1,32 +1,58 @@
 // Copyright (c) 2022, Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Fixed-iteration median timer. Median rather than mean for robustness to
-//! scheduler/turbo noise, and fixed iteration counts so medians are
-//! comparable run-for-run with the PQShield NIST-sig-zoo, which uses the
-//! same method.
+//! Adaptive-iteration median timer.
+//!
+//! The method, end to end: the benchmark thread is pinned first
+//! ([`pin_thread`]), the CPU is brought to sustained frequency
+//! ([`ramp_cpu`]), and each operation is then timed alone - warmup
+//! iterations, a one-call probe to size the sample count, then the timed
+//! loop. The reported number is the median, which is robust to the
+//! scheduler/interrupt tail that makes means jump between runs; p10/p90 are
+//! recorded too so the spread stays visible in the CSV.
+//!
+//! Wall clock: `std::time::Instant`, which is
+//! `clock_gettime(CLOCK_MONOTONIC)` on Linux and the mach monotonic clock on
+//! macOS - the same clock a hand-rolled libc binding would read, so no
+//! separate binding is kept.
+//!
+//! Cycles: rdpmc CPU_CYCLES on x86_64 Linux only (see the `cycles` module).
+//! Apple Silicon exposes no user-space cycle counter, so macOS rows are
+//! wall-clock only, and the report says so.
 
 use std::hint::black_box;
 use std::time::Instant;
 
-/// Iteration counts for one run, shared across every scheme so the
-/// comparison is apples-to-apples.
+/// An op whose single-call probe exceeds this gets fewer than
+/// `target_iters` iterations (see [`measure`]).
+pub const SLOW_OP_NS: u64 = 1_000_000;
+
+/// Rough wall-time cap for one measurement of a slow op: iterations =
+/// budget / probe, clamped to [`MIN_ITERS`]`..=target_iters`. 1 s over a
+/// 1 ms threshold makes the boundary continuous: a probe right at 1 ms
+/// still yields the full 1000 iterations.
+pub const OP_TIME_BUDGET_NS: u64 = 1_000_000_000;
+
+/// Sample-count floor, so a median still means something even for
+/// SLH-DSA's hundreds-of-ms signing.
+pub const MIN_ITERS: usize = 30;
+
+/// Per-run measurement policy, shared across every scheme so the comparison
+/// is apples-to-apples.
 #[derive(Clone, Copy)]
 pub struct Budget {
+    /// Untimed iterations before the probe: pays for cold caches, branch
+    /// predictors, and first-call lazy setup outside the sample.
     pub warmup: usize,
-    /// The on-chain op and the gas driver; 1000 matches the PQShield zoo.
-    pub verify_iters: usize,
-    /// Keygen/sign never run on-chain and SLH-DSA signs in ~0.05–1 s, so 100
-    /// keeps the run short while the median stays stable (< 1% drift).
-    pub offchain_iters: usize,
+    /// Sample count for ops at or under [`SLOW_OP_NS`] per call.
+    pub target_iters: usize,
 }
 
 impl Default for Budget {
     fn default() -> Self {
         Budget {
             warmup: 2,
-            verify_iters: 1000,
-            offchain_iters: 100,
+            target_iters: 1000,
         }
     }
 }
@@ -35,21 +61,15 @@ impl Default for Budget {
 #[derive(Clone, Copy)]
 pub struct Timing {
     pub ns_median: u64,
+    /// 10th/90th percentiles of the same sample; a wide p10–p90 band means
+    /// the median above it deserves less trust.
+    pub ns_p10: u64,
+    pub ns_p90: u64,
+    /// Median of rdpmc CPU_CYCLES deltas; `None` off x86_64 Linux or when
+    /// perf is unavailable (perf_event_paranoid, missing rdpmc cap).
     pub cyc_median: Option<u64>,
+    /// Iterations actually sampled, after the adaptive scale-down.
     pub iters: usize,
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-fn rdtsc_serialized() -> u64 {
-    // lfence-rdtsc-lfence: a serialized read so we time the op, not pipeline
-    // reordering.
-    unsafe {
-        core::arch::x86_64::_mm_lfence();
-        let t = core::arch::x86_64::_rdtsc();
-        core::arch::x86_64::_mm_lfence();
-        t
-    }
 }
 
 /// Busy-spin for `ms` milliseconds so every core the scheduler might pick is
@@ -69,161 +89,348 @@ pub fn ramp_cpu(ms: u64) {
     }
 }
 
-/// Time `f` for exactly `iters` iterations (after `warmup` untimed ones);
-/// the result is `black_box`ed so the optimizer can't delete the work.
-pub fn measure<T, F: FnMut() -> T>(mut f: F, warmup: usize, iters: usize) -> Timing {
-    assert!(iters > 0, "zero iterations would index an empty sample set");
+/// Pin the calling thread for the whole run; returns a description of what
+/// was actually done, printed verbatim in the report's method preamble so
+/// the preamble can never claim a pin the platform didn't perform.
+///
+/// Linux: `sched_setaffinity` to one fixed CPU - a nonzero one, because
+/// CPU 0 takes most IRQ traffic on common configurations.
+#[cfg(target_os = "linux")]
+pub fn pin_thread() -> String {
+    let cpu = if std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        > 1
+    {
+        1
+    } else {
+        0
+    };
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(cpu, &mut set);
+        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0 {
+            format!("sched_setaffinity to CPU {cpu}")
+        } else {
+            format!("UNPINNED - sched_setaffinity to CPU {cpu} failed")
+        }
+    }
+}
 
-    for _ in 0..warmup {
+/// macOS has no core-pinning API; the closest is raising the thread's QoS
+/// class, which stops the scheduler from parking it on efficiency cores -
+/// the main source of run-to-run drift on Apple Silicon.
+#[cfg(target_os = "macos")]
+pub fn pin_thread() -> String {
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+    "QoS USER_INTERACTIVE (macOS has no core pinning; this keeps the thread on performance cores)"
+        .to_string()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn pin_thread() -> String {
+    "not pinned (no pinning support wired for this OS)".to_string()
+}
+
+/// What the wall clock actually is on this platform, for the report
+/// preamble. `Instant` is implemented as `clock_gettime(CLOCK_MONOTONIC)` on
+/// Linux and the mach monotonic clock on macOS (std's sys/time.rs), so
+/// reading it is the same syscall a direct libc call would make.
+pub fn clock_desc() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "CLOCK_MONOTONIC (via std::time::Instant)"
+    } else if cfg!(target_os = "macos") {
+        "mach monotonic clock via std::time::Instant (macOS's CLOCK_MONOTONIC equivalent)"
+    } else {
+        "std::time::Instant (monotonic)"
+    }
+}
+
+/// `Some(description)` when the cycle counter is live on this thread,
+/// `None` otherwise. The report uses this to only claim what actually ran.
+pub fn cycle_counter_desc() -> Option<&'static str> {
+    cycles::desc()
+}
+
+/// Time `f`: `warmup` untimed iterations, then a one-call probe that sizes
+/// the sample count, then the timed loop. Fast ops (probe ≤ [`SLOW_OP_NS`])
+/// get the full `target_iters`; slow ones get [`OP_TIME_BUDGET_NS`]` /
+/// probe`, floored at [`MIN_ITERS`], so one measurement costs bounded time
+/// instead of stretching the run by 1000× the op time. Every result is
+/// `black_box`ed so the optimizer can't delete the work.
+pub fn measure<T, F: FnMut() -> T>(mut f: F, b: &Budget) -> Timing {
+    assert!(
+        b.target_iters >= MIN_ITERS,
+        "target below the floor would make the clamp nonsensical"
+    );
+
+    for _ in 0..b.warmup {
         black_box(f());
     }
 
+    let t0 = Instant::now();
+    black_box(f());
+    let probe_ns = (t0.elapsed().as_nanos() as u64).max(1);
+    let iters = if probe_ns <= SLOW_OP_NS {
+        b.target_iters
+    } else {
+        ((OP_TIME_BUDGET_NS / probe_ns) as usize).clamp(MIN_ITERS, b.target_iters)
+    };
+
     let mut ns = Vec::with_capacity(iters);
-    #[cfg(target_arch = "x86_64")]
-    let mut cy = Vec::with_capacity(iters);
+    let mut cy: Vec<u64> = Vec::new();
 
     for _ in 0..iters {
-        // Cycles are the exact column cross-checked against the PQShield zoo
+        // The cycle window sits inside the wall-clock window so it never
+        // includes the Instant calls.
         let t0 = Instant::now();
-        #[cfg(target_arch = "x86_64")]
-        let c0 = rdtsc_serialized();
+        let c0 = cycles::read();
         black_box(f());
-        #[cfg(target_arch = "x86_64")]
-        cy.push(rdtsc_serialized().saturating_sub(c0));
+        let c1 = cycles::read();
         ns.push(t0.elapsed().as_nanos() as u64);
+        if let (Some(a), Some(b)) = (c0, c1) {
+            cy.push(b.wrapping_sub(a));
+        }
     }
 
     ns.sort_unstable();
-    let ns_median = ns[ns.len() / 2];
+    // Nearest-rank on the sorted sample; (len-1)*p/100 keeps the index in
+    // range for any sample size down to 1.
+    let pct = |v: &[u64], p: usize| v[(v.len() - 1) * p / 100];
 
-    #[cfg(target_arch = "x86_64")]
-    let cyc_median = {
+    let cyc_median = if cy.is_empty() {
+        None
+    } else {
         cy.sort_unstable();
-        Some(cy[cy.len() / 2])
+        Some(pct(&cy, 50))
     };
-    #[cfg(not(target_arch = "x86_64"))]
-    let cyc_median = None;
 
     Timing {
-        ns_median,
+        ns_median: pct(&ns, 50),
+        ns_p10: pct(&ns, 10),
+        ns_p90: pct(&ns, 90),
         cyc_median,
         iters,
     }
 }
 
-/// Distribution of per-round times for one side of a paired measurement.
-#[derive(Clone, Copy)]
-pub struct RoundStats {
-    pub p10_ns: u64,
-    pub median_ns: u64,
-    pub p90_ns: u64,
-}
+/// Real core cycles from user space, x86_64 Linux only:
+/// `perf_event_open(PERF_COUNT_HW_CPU_CYCLES, exclude_kernel)`, mmap the
+/// perf page, check `cap_user_rdpmc`, then read with `rdpmc` under the
+/// seqlock protocol documented in perf_event.h. Unlike rdtsc this counts
+/// actual core cycles (comparable across frequency changes), and unlike a
+/// `read()` on the fd it costs tens of cycles per sample instead of a
+/// syscall.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod cycles {
+    use std::ptr;
+    use std::sync::atomic::{fence, Ordering};
 
-/// Result of [`measure_paired`]: per-side round distributions plus the
-/// distribution of the per-round delta. The delta is the number to trust:
-/// drift that hits both sides (core migration, frequency steps, background
-/// load) cancels out of it, while it fully contaminates an A-block-then-
-/// B-block comparison.
-#[derive(Clone, Copy)]
-pub struct Paired {
-    pub a: RoundStats,
-    pub b: RoundStats,
-    /// (p10, median, p90) of per-round `(a - b) / b`, in percent. If the
-    /// whole interval sits on one side of zero, the difference is real.
-    pub delta_pct: (f64, f64, f64),
-}
+    // perf_event.h values used below.
+    const PERF_TYPE_HARDWARE: u32 = 0;
+    const PERF_COUNT_HW_CPU_CYCLES: u64 = 0;
+    const PERF_ATTR_SIZE_VER0: u32 = 64;
+    const FLAG_EXCLUDE_KERNEL: u64 = 1 << 5;
+    const FLAG_EXCLUDE_HV: u64 = 1 << 6;
 
-/// How one batch of calls is reduced to a single per-round time.
-#[derive(Clone, Copy)]
-pub enum BatchStat {
-    /// For ops whose work is fixed (keygen, verify): interference is
-    /// one-sided — an interrupt or a slow core only ever adds time — so the
-    /// min is the cleanest estimate of the true cost under that instant's
-    /// conditions.
-    Min,
-    /// For ops whose work is intrinsically random (ML-DSA signing rejection-
-    /// samples, ~4 attempts on average): the quantity of interest is the
-    /// expected cost, and the min would only find the batch's luckiest draw.
-    Mean,
-}
+    /// First 64 bytes of `struct perf_event_attr` (PERF_ATTR_SIZE_VER0).
+    /// Declaring only the prefix and passing size = 64 keeps this
+    /// independent of whichever perf ABI revision the libc crate ships.
+    #[repr(C)]
+    #[derive(Default)]
+    struct PerfEventAttr {
+        type_: u32,
+        size: u32,
+        config: u64,
+        sample_period: u64,
+        sample_type: u64,
+        read_format: u64,
+        flags: u64,
+        wakeup_events: u32,
+        bp_type: u32,
+        bp_addr: u64,
+    }
 
-fn batch_time<T>(f: &mut impl FnMut() -> T, n: usize, stat: BatchStat) -> u64 {
-    match stat {
-        BatchStat::Min => {
-            let mut best = u64::MAX;
-            for _ in 0..n {
-                let t0 = Instant::now();
-                black_box(f());
-                best = best.min(t0.elapsed().as_nanos() as u64);
+    /// Prefix of `struct perf_event_mmap_page` through `pmc_width`; the
+    /// rdpmc protocol needs nothing past it.
+    #[repr(C)]
+    struct PerfEventMmapPage {
+        version: u32,
+        compat_version: u32,
+        lock: u32,
+        index: u32,
+        offset: i64,
+        time_enabled: u64,
+        time_running: u64,
+        capabilities: u64,
+        pmc_width: u16,
+    }
+
+    pub struct CycleCounter {
+        fd: libc::c_int,
+        page: *const PerfEventMmapPage,
+    }
+
+    impl CycleCounter {
+        fn open() -> Option<CycleCounter> {
+            let attr = PerfEventAttr {
+                type_: PERF_TYPE_HARDWARE,
+                size: PERF_ATTR_SIZE_VER0,
+                config: PERF_COUNT_HW_CPU_CYCLES,
+                // User-space cycles only; counting the kernel would fold
+                // interrupt handlers into whichever iteration they land on.
+                flags: FLAG_EXCLUDE_KERNEL | FLAG_EXCLUDE_HV,
+                ..Default::default()
+            };
+
+            // pid 0 / cpu -1: this thread, whichever CPU it runs on (it is
+            // pinned by the time anything is measured).
+            let fd = unsafe {
+                libc::syscall(
+                    libc::SYS_perf_event_open,
+                    &attr as *const PerfEventAttr,
+                    0,
+                    -1,
+                    -1,
+                    0,
+                ) as libc::c_int
+            };
+            if fd < 0 {
+                // Typically perf_event_paranoid too high; fall back to
+                // wall-clock only rather than requiring root.
+                return None;
             }
-            best
-        }
-        BatchStat::Mean => {
-            // One timer span around the whole batch: the mean needs the sum
-            // anyway, and this keeps the timer out of the inner loop.
-            let t0 = Instant::now();
-            for _ in 0..n {
-                black_box(f());
+
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+            let page = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    page_size,
+                    libc::PROT_READ,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                )
+            };
+            if page == libc::MAP_FAILED {
+                unsafe { libc::close(fd) };
+                return None;
             }
-            t0.elapsed().as_nanos() as u64 / n as u64
+            let counter = CycleCounter {
+                fd,
+                page: page as *const PerfEventMmapPage,
+            };
+
+            // cap_user_rdpmc (capabilities bit 2) is the kernel confirming
+            // user-space rdpmc is wired for this event; without it the
+            // instruction would fault. Dropping `counter` on the way out
+            // runs Drop, which unmaps and closes.
+            let caps = unsafe { ptr::read_volatile(&(*counter.page).capabilities) };
+            if (caps >> 2) & 1 == 0 {
+                return None;
+            }
+            // index can be 0 until the event is scheduled in; probe once so
+            // a dead counter is reported as absent, not as an empty column.
+            counter.read()?;
+            Some(counter)
         }
+
+        /// One counter sample. `None` when the event isn't scheduled on this
+        /// CPU right now (mmap index 0); the caller skips that iteration's
+        /// cycle delta.
+        pub fn read(&self) -> Option<u64> {
+            unsafe {
+                loop {
+                    let seq = ptr::read_volatile(&(*self.page).lock);
+                    fence(Ordering::Acquire);
+                    let index = ptr::read_volatile(&(*self.page).index);
+                    let offset = ptr::read_volatile(&(*self.page).offset);
+                    let width = ptr::read_volatile(&(*self.page).pmc_width) as u32;
+                    let value = if index == 0 {
+                        None
+                    } else {
+                        // rdpmc counter numbers are index-1 by the protocol.
+                        let raw = rdpmc(index - 1);
+                        // The PMC is pmc_width bits wide; sign-extend so the
+                        // kernel's signed base offset composes correctly.
+                        let shift = 64 - width.clamp(1, 64);
+                        let signed = ((raw << shift) as i64) >> shift;
+                        Some(offset.wrapping_add(signed) as u64)
+                    };
+                    fence(Ordering::Acquire);
+                    // The kernel bumps `lock` around page updates (seqlock);
+                    // retry if an update raced the reads above.
+                    if ptr::read_volatile(&(*self.page).lock) == seq {
+                        return value;
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for CycleCounter {
+        fn drop(&mut self) {
+            unsafe {
+                let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+                libc::munmap(self.page as *mut libc::c_void, page_size);
+                libc::close(self.fd);
+            }
+        }
+    }
+
+    #[inline]
+    fn rdpmc(counter: u32) -> u64 {
+        let lo: u32;
+        let hi: u32;
+        // lfence on both sides so the counter brackets the measured op, not
+        // the pipeline's reordering of it (same reason the old rdtsc path
+        // was serialized).
+        unsafe {
+            core::arch::x86_64::_mm_lfence();
+            core::arch::asm!(
+                "rdpmc",
+                in("ecx") counter,
+                out("eax") lo,
+                out("edx") hi,
+                options(nomem, nostack, preserves_flags)
+            );
+            core::arch::x86_64::_mm_lfence();
+        }
+        ((hi as u64) << 32) | lo as u64
+    }
+
+    thread_local! {
+        // Per-thread because the perf event is opened for the calling
+        // thread; the bench only ever measures from one pinned thread.
+        static COUNTER: Option<CycleCounter> = CycleCounter::open();
+    }
+
+    #[inline]
+    pub fn read() -> Option<u64> {
+        COUNTER.with(|c| c.as_ref().and_then(|c| c.read()))
+    }
+
+    /// `Some` only when the counter actually opened on this thread.
+    pub fn desc() -> Option<&'static str> {
+        COUNTER.with(|c| {
+            c.as_ref()
+                .map(|_| "rdpmc CPU_CYCLES (perf_event_open, user-space, exclude_kernel)")
+        })
     }
 }
 
-/// Interleaved A/B measurement: `rounds` rounds of (`per_round` calls of A,
-/// `per_round` calls of B), alternating which side goes first so ordering
-/// bias cancels too. A sequential design (all of A, then all of B) lets the
-/// scheduler bias an entire block — every sample in it, uniformly — and no
-/// within-block statistic can detect that. Interleaving puts the paired
-/// batches within a millisecond of each other, so they almost always share
-/// core placement and frequency state.
-pub fn measure_paired<TA, TB>(
-    mut a: impl FnMut() -> TA,
-    mut b: impl FnMut() -> TB,
-    warmup: usize,
-    rounds: usize,
-    per_round: usize,
-    stat: BatchStat,
-) -> Paired {
-    assert!(rounds > 0 && per_round > 0);
-    for _ in 0..warmup {
-        black_box(a());
-        black_box(b());
+/// No user-space cycle counter here: Apple Silicon has none, and no other
+/// target is wired. Wall clock only.
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+mod cycles {
+    #[inline]
+    pub fn read() -> Option<u64> {
+        None
     }
 
-    let mut a_ns = Vec::with_capacity(rounds);
-    let mut b_ns = Vec::with_capacity(rounds);
-    let mut deltas = Vec::with_capacity(rounds);
-    for r in 0..rounds {
-        let (ta, tb);
-        if r % 2 == 0 {
-            ta = batch_time(&mut a, per_round, stat);
-            tb = batch_time(&mut b, per_round, stat);
-        } else {
-            tb = batch_time(&mut b, per_round, stat);
-            ta = batch_time(&mut a, per_round, stat);
-        }
-        a_ns.push(ta);
-        b_ns.push(tb);
-        deltas.push((ta as f64 - tb as f64) / tb as f64 * 100.0);
-    }
-
-    a_ns.sort_unstable();
-    b_ns.sort_unstable();
-    deltas.sort_unstable_by(f64::total_cmp);
-
-    let stats = |v: &[u64]| RoundStats {
-        p10_ns: v[v.len() / 10],
-        median_ns: v[v.len() / 2],
-        p90_ns: v[v.len() * 9 / 10],
-    };
-    Paired {
-        a: stats(&a_ns),
-        b: stats(&b_ns),
-        delta_pct: (
-            deltas[deltas.len() / 10],
-            deltas[deltas.len() / 2],
-            deltas[deltas.len() * 9 / 10],
-        ),
+    pub fn desc() -> Option<&'static str> {
+        None
     }
 }

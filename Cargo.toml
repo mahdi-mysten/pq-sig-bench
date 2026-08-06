@@ -9,30 +9,39 @@ description = "Signature benchmarks for the post-quantum schemes proposed for fa
 [workspace]
 
 [dependencies]
-# Ed25519 baseline and the FN-DSA-512 row. `falcon-sign` exposes keygen/sign;
-# verify is always available through the in-crate strict verifier.
-fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", branch = "mahdi/fn-dsa-512", features = ["falcon-sign"] }
+# Ed25519 baseline and the SLH-DSA-SHA2-128s row (sphincs module, behind
+# `experimental`). This branch carries the top-level FIPS 205 sign/verify
+# plus NIST ACVP KATs; upstream main's sphincs has only the FORS/XMSS/
+# hypertree building blocks, with no way to run the full scheme. The branch
+# has no falcon module, so both FN-DSA rows come from pqcrypto-falcon below.
+fastcrypto = { git = "https://github.com/mahdi-mysten/fastcrypto", branch = "feat/slh-dsa-toplevel", features = ["experimental"] }
 
-# FN-DSA-1024 row, plus the interop oracle the FN-DSA-512 self-check runs
-# against. default-features = false matches fastcrypto's own configuration
-# (portable "clean" C, no NEON/AVX2); cargo unifies features per crate, so a
-# default-features dep here would silently swap the SIMD build into
-# fastcrypto's sign path too.
+# Both FN-DSA rows: PQClean's portable "clean" C in the padded fixed-size
+# signature format. default-features = false keeps SIMD off (no NEON/AVX2),
+# matching the configuration fastcrypto ships.
 pqcrypto-falcon = { version = "0.4", default-features = false, features = ["std"] }
 pqcrypto-traits = "0.3"
 
-# ML-DSA-44/65/87 rows (mldsa-native C imported by AWS-LC, behind `unstable`).
+# ML-DSA-65 contender in section 2 of the report (mldsa-native C imported by
+# AWS-LC, behind `unstable`), and the cross-verification oracle for the
+# wrapper rows.
 aws-lc-rs = { version = "1.17", features = ["unstable"] }
 
-# The `mldsa65` bin's other contender: our own wrapper around the same
-# mldsa-native C, from the sibling checkout so it benchmarks the working tree.
-# TODO: replace it with the git link once it is public
-mysten-mldsa-native-rs = { path = "../mysten-mldsa-native-rs" }
+# The ML-DSA rows: our own crate around the same mldsa-native C. Tracks the
+# multilevel branch because the 44/87 feature gates live there. Point it back
+# at `path = "../mysten-mldsa-native-rs"` to bench the working tree instead.
+mysten-mldsa-native-rs = { git = "https://github.com/MystenLabs/mysten-mldsa-native-rs.git", branch = "mahdi/multilevel-v2", features = ["mldsa44", "mldsa87"] }
 rand = "0.8.5"
 
-# QoS pinning for the `mldsa65` bin: keeps the timing thread on the
-# performance cores, the main source of run-to-run drift on Apple Silicon.
-[target.'cfg(target_os = "macos")'.dependencies]
+# The remaining ML-DSA-65 contenders for section 2: RustCrypto pure Rust,
+# Cryspen's libcrux, and PQClean's reference C behind bindings.
+ml-dsa = "0.1.1"
+libcrux-ml-dsa = "0.0.10"
+pqcrypto-mldsa = "0.1.2"
+
+# Measurement plumbing: sched_setaffinity + perf_event_open/rdpmc on Linux,
+# the QoS performance-core pin on macOS (there is no core pinning there).
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = "0.2"
 
 [features]
